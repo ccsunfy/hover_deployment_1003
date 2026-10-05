@@ -53,9 +53,20 @@ except ImportError:
 # ---------------------------------------------------------------- 颜色阈值
 # 与 segmentation.py 同一套标定值（HSV：H 0~179, S/V 0~255）
 COLOR_HSV = {
-    "red": [((0, 90, 70), (10, 255, 255)),
-            ((168, 90, 70), (180, 255, 255))],
-    "yellow": [((15, 150, 90), (38, 255, 255))],
+    # 红色用四段区间：
+    #   前两段：主体。饱和度下限 90→55 —— 强光下红面被冲淡（实测 S 掉到 70）时，
+    #          旧阈值会整片判成背景。色相与亮度下限保持原样（放宽会引入暗棕/土色误检）。
+    #   后两段：亮面。反光处接近白（S 低、V 很高），接住它 mask 才连成整块。
+    #          要求 S≥35 是为了不把纯白/亮灰（S 通常 <25）误当成红。
+    # 阴影/逆光下的暗红面由 DARK_RANGES 的滞后阈值处理（见 detect）。
+    "red": [((0, 55, 70), (10, 255, 255)),
+            ((165, 55, 70), (180, 255, 255)),
+            ((0, 35, 190), (10, 255, 255)),
+            ((168, 35, 190), (180, 255, 255))],
+    # 黄色：色相收窄到 19~30（实测桶像素 H 的 p1~p99 = 20~26，留了余量）。
+    # 原来的 15~38 会覆盖大部分枯草色相；野外强光下枯草的饱和度会升高，
+    # 一旦越过 S 下限就会误检 —— 收窄色相把 H 15~18 / 31~45 的草直接排除。
+    "yellow": [((19, 150, 90), (30, 255, 255))],
     # 蓝色用两段区间（浅蓝板 + 亮面高光）：
     #   区间1 主体：饱和度下限放宽到 70（浅蓝板本身饱和度不高），亮度下限抬到 95
     #        （把实验场地那种偏暗的地面挡在外面）
@@ -64,6 +75,23 @@ COLOR_HSV = {
     "blue": [((95, 70, 95), (130, 255, 255)),
              ((88, 40, 165), (132, 255, 255))],
 }
+
+# 暗部区间：阴影/逆光下的目标表面（或被无人机自身遮光时）亮度掉得很低，
+# 但饱和度仍然很高。单靠把主区间的 V 下限压低会引入暗色杂物，
+# 所以单独加一段"暗但饱和"的区间（红/黄 S≥110，蓝 S≥130）。
+# 蓝的 S 下限更高：之前为了排除"深色场地"已把蓝主区间的 V 下限抬到 95，
+# 这段暗部区间用"高饱和"把场地（实测 S≈110）和阴影桶（S≈200）分开。
+DARK_RANGES = {
+    "red": [((0, 110, 30), (12, 255, 110)),
+            ((165, 110, 30), (180, 255, 110))],
+    "yellow": [((19, 110, 40), (30, 255, 110))],
+    "blue": [((95, 130, 30), (130, 255, 95))],
+}
+
+
+def color_ranges(color, use_dark=True):
+    """该颜色的完整阈值区间（主区间 + 亮面 + 暗部）。"""
+    return list(COLOR_HSV[color]) + (list(DARK_RANGES[color]) if use_dark else [])
 COLOR_BGR = {"red": (0, 0, 255), "yellow": (0, 255, 255), "blue": (255, 0, 0)}
 COLOR_ID = {"red": 1, "yellow": 2, "blue": 3}   # 与 segmentation.py 标签图一致；ROS 版发话题也用
 
@@ -81,13 +109,20 @@ class ColorBucketDetector:
     """单色圆筒检测器：阈值 → 形态学 → 孔洞填充 → 连通域 → 形状筛选 → 时序平滑。"""
 
     def __init__(self, color, proc_width=640, min_area=100, min_solidity=0.70,
-                 max_elongation=3.0, smooth=0.5, confirm=2, miss=5, temporal=True,
+                 max_elongation=4.0, smooth=0.5, confirm=2, miss=5, temporal=True,
                  reacquire=0.25, keep_all=False,
-                 max_ellipse_residual=0.075, ellipse_residual_k=0.75):
+                 max_ellipse_residual=0.075, ellipse_residual_k=0.75, loose=False,
+                 use_dark_ranges=True,
+                 strong_px_min=30, strong_frac_min=0.05):
         if color not in COLOR_HSV:
             raise ValueError(f"不支持的颜色: {color}（可选 {list(COLOR_HSV)}）")
         self.color = color
-        self.ranges = COLOR_HSV[color]          # 只保留选中颜色 → 其他颜色天然屏蔽
+        # 只保留选中颜色 → 其他颜色天然屏蔽；含暗部区间（阴影/逆光下仍能分割）
+        self.use_dark_ranges = use_dark_ranges
+        self.ranges = color_ranges(color, use_dark_ranges)
+        # 滞后阈值：采纳暗部区间所需的最少强证据像素（绝对值 / 占连通域比例）
+        self.strong_px_min = strong_px_min
+        self.strong_frac_min = strong_frac_min
         self.proc_width = proc_width
         self.min_area = min_area
         self.min_solidity = min_solidity
@@ -96,6 +131,9 @@ class ColorBucketDetector:
         # 残差 = 轮廓点变换到拟合椭圆的归一化坐标系后的半径标准差（完美圆/椭圆 ≈ 0）
         self.max_ellipse_residual = max_ellipse_residual
         self.ellipse_residual_k = ellipse_residual_k
+        # 宽松模式：跳过形态学与全部形状筛选，只按"颜色 + 最小面积"取目标。
+        # 用于调试/召回优先的场合（等于回到最早那版行为）。
+        self.loose = loose
         self.k_open = scaled_kernel(9, proc_width)
         self.k_close = scaled_kernel(25, proc_width)
         # 时序状态
@@ -112,7 +150,7 @@ class ColorBucketDetector:
         if color not in COLOR_HSV:
             raise ValueError(f"不支持的颜色: {color}（可选 {list(COLOR_HSV)}）")
         self.color = color
-        self.ranges = COLOR_HSV[color]
+        self.ranges = color_ranges(color, self.use_dark_ranges)
         self.cx = self.cy = None
         self.hits = self.misses = 0
 
@@ -126,16 +164,30 @@ class ColorBucketDetector:
                    self.ellipse_residual_k / math.sqrt(max(1.0, float(area))))
 
     @staticmethod
-    def ellipse_residual(contour):
+    def ellipse_residual(contour, shape=None):
         """轮廓到拟合椭圆的归一化半径标准差：完美圆/椭圆≈0，方块≈0.10，三角≈0.19。
 
         做法：cv2.fitEllipse 拟合 → 把轮廓点旋转到椭圆主轴坐标系、按半轴归一化，
         完美椭圆上所有点半径恒为 1，残差即半径的离散程度。对长宽比不敏感
         （2:1、3:1 的斜视椭圆依然是"圆"）。
+
+        shape 给定时：**剔除贴着画面边缘的轮廓点**再拟合 —— 贴脸时目标被画面裁切，
+        被切掉的那部分轮廓本来就不该参与"像不像椭圆"的判断；同时做退化保护，
+        避免把一条直线拟合成巨大的椭圆而得到虚假的低残差。
         """
-        if len(contour) < 5:            # fitEllipse 至少需要 5 个点
+        pts = contour.reshape(-1, 2).astype(np.float64)
+        if shape is not None and len(pts) >= 20:
+            mh, mw = shape[:2]
+            keep = ((pts[:, 0] > 2) & (pts[:, 0] < mw - 3)
+                    & (pts[:, 1] > 2) & (pts[:, 1] < mh - 3))
+            if keep.sum() >= max(20, 0.3 * len(pts)):
+                pts = pts[keep]
+        if len(pts) < 5:                # fitEllipse 至少需要 5 个点
             return None
-        (cx, cy), (ax1, ax2), ang = cv2.fitEllipse(contour)
+        (cx, cy), (ax1, ax2), ang = cv2.fitEllipse(pts.reshape(-1, 1, 2).astype(np.float32))
+        # 退化保护：拟合椭圆远大于点云范围（直线/窄条容易被拟合成巨大椭圆）→ 判为不像椭圆
+        if max(ax1, ax2) > 4.0 * max(np.ptp(pts[:, 0]), np.ptp(pts[:, 1]), 1.0):
+            return 1.0
         a, b = ax1 / 2.0, max(1e-6, ax2 / 2.0)
         th = math.radians(ang)
         pts = contour.reshape(-1, 2).astype(np.float64) - (cx, cy)
@@ -146,12 +198,14 @@ class ColorBucketDetector:
 
     def _best_blob(self, mask):
         """挑出最像圆筒的一块，返回 (质心x, 质心y, 面积, 包围框, 该块mask, 椭圆残差)。"""
+        mh, mw = mask.shape[:2]
         n, labels, stats, cents = cv2.connectedComponentsWithStats(mask, 8)
         best = None
         for i in range(1, n):
             area = int(stats[i, cv2.CC_STAT_AREA])
             if area < self.min_area:
                 continue
+            x, y, w, h = stats[i, 0], stats[i, 1], stats[i, 2], stats[i, 3]
             comp = (labels == i).astype(np.uint8) * 255
             cnts, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
             c = max(cnts, key=cv2.contourArea)
@@ -159,13 +213,14 @@ class ColorBucketDetector:
             solidity = float(cv2.contourArea(c)) / hull_area
             (_, _), (rw, rh), _ = cv2.minAreaRect(c)
             elongation = max(rw, rh) / max(1.0, min(rw, rh))
-            if solidity < self.min_solidity or elongation > self.max_elongation:
-                continue
-            resid = self.ellipse_residual(c)
-            if resid is not None and resid > self.residual_limit(area):
-                continue                      # 不是圆/椭圆（方块、三角、星形…）
+            resid = None
+            if not self.loose:                     # 宽松模式不做形状筛选
+                if solidity < self.min_solidity or elongation > self.max_elongation:
+                    continue
+                resid = self.ellipse_residual(c, mask.shape)
+                if resid is not None and resid > self.residual_limit(area):
+                    continue                  # 不是圆/椭圆（方块、三角、星形…）
             if best is None or area > best[2]:
-                x, y, w, h = stats[i, 0], stats[i, 1], stats[i, 2], stats[i, 3]
                 best = (float(cents[i][0]), float(cents[i][1]), area, (x, y, w, h),
                         comp, resid)
         return best
@@ -182,14 +237,40 @@ class ColorBucketDetector:
 
         hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
         mask = np.zeros((ph, pw), np.uint8)
-        for lo, hi in self.ranges:
-            mask |= cv2.inRange(hsv, np.array(lo, np.uint8), np.array(hi, np.uint8))
 
-        k_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (self.k_open, self.k_open))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k_open)
-        k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (self.k_close, self.k_close))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_close)
-        mask = cv2.medianBlur(mask, 3)   # 去掉单像素毛刺：边界更平滑，消除锯齿
+        if self.use_dark_ranges:
+            # 滞后阈值：强证据（正常亮度下明确是目标颜色）直接算；
+            # 弱证据（暗部区间，阴影/逆光下的目标表面）只有在与强证据连通时才采纳。
+            # 这样既能补全阴影里的桶面，又不会把孤立的深棕色/暗红色物体误检成目标。
+            strong = np.zeros((ph, pw), np.uint8)
+            for lo, hi in COLOR_HSV[self.color]:
+                strong |= cv2.inRange(hsv, np.array(lo, np.uint8), np.array(hi, np.uint8))
+            weak = np.zeros((ph, pw), np.uint8)
+            for lo, hi in DARK_RANGES[self.color]:
+                weak |= cv2.inRange(hsv, np.array(lo, np.uint8), np.array(hi, np.uint8))
+            weak &= cv2.bitwise_not(strong)
+            if weak.any():
+                n, labels = cv2.connectedComponents(strong | weak, 8)
+                sizes = np.bincount(labels.ravel(), minlength=n)
+                strong_cnt = np.bincount(labels[strong > 0].ravel(), minlength=n)
+                keep = np.zeros(n, bool)
+                for i in range(1, n):
+                    if strong_cnt[i] >= max(self.strong_px_min,
+                                            self.strong_frac_min * sizes[i]):
+                        keep[i] = True
+                mask = (keep[labels] * 255).astype(np.uint8)
+            else:
+                mask = strong
+        else:
+            for lo, hi in self.ranges:
+                mask |= cv2.inRange(hsv, np.array(lo, np.uint8), np.array(hi, np.uint8))
+
+        if not self.loose:               # 宽松模式跳过全部形态学
+            k_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (self.k_open, self.k_open))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k_open)
+            k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (self.k_close, self.k_close))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_close)
+            mask = cv2.medianBlur(mask, 3)   # 去掉单像素毛刺：边界更平滑，消除锯齿
 
         # 外轮廓填充：补掉高光造成的内部空洞，得到实心目标
         cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -484,7 +565,12 @@ def main_standalone():
                     help="处理分辨率宽度（越小越快，默认 640）")
     ap.add_argument("--min-area", type=int, default=100, help="最小面积（处理尺度像素）")
     ap.add_argument("--min-solidity", type=float, default=0.70, help="最小凸度")
-    ap.add_argument("--max-elongation", type=float, default=3.0, help="最大伸长率")
+    ap.add_argument("--no-dark-ranges", action="store_true",
+                    help="不使用暗部区间（阴影/逆光下的目标会更容易漏检）")
+    ap.add_argument("--loose", action="store_true",
+                    help="宽松模式：跳过形态学与全部形状筛选，只按颜色+面积取目标（召回优先）")
+    ap.add_argument("--max-elongation", type=float, default=4.0,
+                    help="最大伸长率（斜视椭圆最长可到 ~4；细长条带由椭圆残差挡）")
     ap.add_argument("--max-ellipse-residual", type=float, default=0.075,
                     help="椭圆残差上限（越小越只认圆/椭圆；方块≈0.10、三角≈0.19）")
     ap.add_argument("--ellipse-residual-k", type=float, default=0.75,
@@ -527,7 +613,9 @@ def main_standalone():
         smooth=args.smooth, confirm=args.confirm, miss=args.miss,
         temporal=not args.no_smooth, reacquire=args.reacquire, keep_all=args.keep_all,
         max_ellipse_residual=args.max_ellipse_residual,
-        ellipse_residual_k=args.ellipse_residual_k)
+        ellipse_residual_k=args.ellipse_residual_k,
+        loose=args.loose,
+        use_dark_ranges=not args.no_dark_ranges)
 
     print(f"[segmotion] 颜色开关 = {args.color.upper()}（其他颜色已屏蔽）")
     print(f"[segmotion] 处理分辨率 {args.proc_width}px，"
@@ -627,35 +715,49 @@ class SegmotionNode(object):
         rospy.init_node("segmotion_node")
 
         # ---------------- 参数
-        self.color = rospy.get_param("~color", "red")
+        # 读完即从 master 删除：roslaunch/命令行传入的私有参数（_x:=y）会在节点退出后
+        # 残留在参数服务器上，导致"上次用 _publish_overlay:=false 跑过，这次不传参数
+        # 启动仍然是关的"——这是很容易踩且很难查的坑，所以在读取后清掉。
+        # （launch 文件里的 param 每次启动都会重新下发，不受影响）
+        def _p(name, default):
+            value = rospy.get_param("~" + name, default)
+            try:
+                rospy.delete_param("~" + name)
+            except Exception:
+                pass
+            return value
+
+        self.color = _p("color", "red")
         if self.color not in COLOR_HSV:
             rospy.logerr("~color=%s 无效，可选 %s", self.color, list(COLOR_HSV))
             raise ValueError("invalid color")
-        image_topic = rospy.get_param("~image_topic", "/usb_cam/image_raw")
-        self.publish_mask = bool(rospy.get_param("~publish_mask", True))
-        self.publish_overlay = bool(rospy.get_param("~publish_overlay", True))
+        image_topic = _p("image_topic", "/usb_cam/image_raw")
+        self.publish_mask = bool(_p("publish_mask", True))
+        self.publish_overlay = bool(_p("publish_overlay", True))
         # 语义图（喂给 diff_land/run.py 的格式，见文件头说明）
-        self.publish_semantic = bool(rospy.get_param("~publish_semantic", True))
-        self.semantic_topic = rospy.get_param("~semantic_topic", "/semantic/image")
-        self.semantic_h = int(rospy.get_param("~semantic_h", 48))
-        self.semantic_w = int(rospy.get_param("~semantic_w", 64))
+        self.publish_semantic = bool(_p("publish_semantic", True))
+        self.semantic_topic = _p("semantic_topic", "/semantic/image")
+        self.semantic_h = int(_p("semantic_h", 48))
+        self.semantic_w = int(_p("semantic_w", 64))
         # 值尺度：255.0 → 0/255（默认，与 diff_land 的 semantic_color.py 格式一致）
         #          1.0   → 0/1（若下游脚本自己做了 /255，会把它再缩小，注意别重复归一化）
-        self.semantic_scale = float(rospy.get_param("~semantic_scale", 255.0))
+        self.semantic_scale = float(_p("semantic_scale", 255.0))
 
         self.detector = ColorBucketDetector(
             self.color,
-            proc_width=int(rospy.get_param("~proc_width", 640)),
-            min_area=int(rospy.get_param("~min_area", 100)),
-            min_solidity=float(rospy.get_param("~min_solidity", 0.70)),
-            max_elongation=float(rospy.get_param("~max_elongation", 3.0)),
-            smooth=float(rospy.get_param("~smooth", 0.5)),
-            confirm=int(rospy.get_param("~confirm_frames", 2)),
-            miss=int(rospy.get_param("~miss_frames", 5)),
-            reacquire=float(rospy.get_param("~reacquire", 0.25)),
-            temporal=bool(rospy.get_param("~temporal", True)),
-            max_ellipse_residual=float(rospy.get_param("~max_ellipse_residual", 0.075)),
-            ellipse_residual_k=float(rospy.get_param("~ellipse_residual_k", 0.75)),
+            proc_width=int(_p("proc_width", 640)),
+            min_area=int(_p("min_area", 100)),
+            min_solidity=float(_p("min_solidity", 0.70)),
+            max_elongation=float(_p("max_elongation", 3.0)),
+            smooth=float(_p("smooth", 0.5)),
+            confirm=int(_p("confirm_frames", 2)),
+            miss=int(_p("miss_frames", 5)),
+            reacquire=float(_p("reacquire", 0.25)),
+            temporal=bool(_p("temporal", True)),
+            max_ellipse_residual=float(_p("max_ellipse_residual", 0.075)),
+            ellipse_residual_k=float(_p("ellipse_residual_k", 0.75)),
+            loose=bool(_p("loose", False)),
+            use_dark_ranges=bool(_p("use_dark_ranges", True)),
         )
 
         # ---------------- 通信
@@ -683,6 +785,8 @@ class SegmotionNode(object):
                       sys.version.split()[0], sys.executable)
         rospy.loginfo("[segmotion] 订阅 %s → 发布 ~mask / ~overlay / ~target / ~locked",
                       image_topic)
+        rospy.loginfo("[segmotion] 发布开关：mask=%s  overlay=%s  semantic=%s",
+                      self.publish_mask, self.publish_overlay, self.publish_semantic)
         if self.publish_semantic:
             rospy.loginfo("[segmotion] 语义图 → %s，尺寸 (%d,%d)，mono8，值域 0/%.0f",
                           self.semantic_topic, self.semantic_h,
