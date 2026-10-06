@@ -22,10 +22,16 @@ from ActionSmoother import Smoother
 
 MODE_CHANNEL = 6
 HOVER_ACC = 9.81
+# HOVER_ACC = 10.2
 MODE_SHIFT_VALUE = 0.25
-HOVER_WHITE_FRACTION = 0.60
+HOVER_WHITE_FRACTION = 0.5
 HOVER_SPEED_LIMIT = 0.50
-HOVER_HOLD_SECONDS = 1.0
+# HOVER_HOLD_SECONDS = 1.0
+HOVER_HOLD_SECONDS = 0.4
+HOVER_BOOST_ACC = 0.8          # 悬停确认瞬间附带的推力增量
+HOVER_BOOST_DECAY_SECONDS = 1.0  # 该增量指数衰减到 ~0 所需时间
+# 悬停确认后是否切换成程序手动给出的悬停指令；False = 只发标志位，继续跑策略
+HOVER_USE_MANUAL_COMMAND = False
 ODOM_TIMEOUT = 0.5
 th.set_grad_enabled(False)
 
@@ -66,6 +72,7 @@ class RealEnv:
         self.last_odom_time = 0.0
         self.hover_started_at = None
         self.hover_confirmed = False
+        self.hover_confirmed_at = None
         self.num_envs = 1
         self.max_sense_radius = 10.0
         # self.target = th.as_tensor([[1.58, -0.07, 0.16]])
@@ -195,9 +202,21 @@ class RealEnv:
             self.hover_started_at = now
         if now - self.hover_started_at >= HOVER_HOLD_SECONDS:
             self.hover_confirmed = True
+            self.hover_confirmed_at = now
             self.hover_success_pub.publish(UInt8(data=1))
             rospy.loginfo(f"{self.log_prefix} 悬停成功：白色占比>60%、速度<0.5m/s 持续1秒")
         return self.hover_confirmed
+
+    def hover_boost(self):
+        """悬停确认后附加的推力增量，从 HOVER_BOOST_ACC 指数衰减到 0。"""
+        if self.hover_confirmed_at is None:
+            return HOVER_BOOST_ACC
+        elapsed = time.monotonic() - self.hover_confirmed_at
+        if elapsed >= HOVER_BOOST_DECAY_SECONDS:
+            return 0.0
+        # 1 秒内衰减到 e^-5 ≈ 0.7%，之后直接归零
+        tau = HOVER_BOOST_DECAY_SECONDS / 5.0
+        return float(HOVER_BOOST_ACC * np.exp(-elapsed / tau))
 
     def _world_to_body_velocity(self):
         """
@@ -251,9 +270,11 @@ class RealEnv:
                 use_fallback_image = True
                 rospy.logwarn_throttle(2, f"{self.log_prefix} 语义图像不可用/超时，使用全黑图像")
 
-        if self.hover_success(semantic_image_copy, time.monotonic()):
+        # 只负责判定并发布悬停成功标志位，指令始终由策略给出
+        hovered = self.hover_success(semantic_image_copy, time.monotonic())
+        if hovered and HOVER_USE_MANUAL_COMMAND:
             hover_cmd = Command()
-            hover_cmd.thrust = HOVER_ACC
+            hover_cmd.thrust = HOVER_ACC + self.hover_boost()
             hover_cmd.angularVel.x = hover_cmd.angularVel.y = hover_cmd.angularVel.z = 0
             hover_cmd.mode = Command.ANGULAR_MODE
             hover_cmd.header.stamp = rospy.Time.now()
